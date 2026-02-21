@@ -1,0 +1,266 @@
+---
+# ─── Namespace ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fraud-detection
+  labels:
+    app: fraud-pipeline
+    tier: production
+
+---
+# ─── ConfigMap ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fraud-pipeline-config
+  namespace: fraud-detection
+data:
+  KAFKA_BOOTSTRAP: "kafka-service:9092"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  TPS: "500"
+  FRAUD_RATE: "0.02"
+  KS_DRIFT_THRESHOLD: "0.1"
+  DRIFT_CHECK_INTERVAL: "300"
+
+---
+# ─── Secret ─────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fraud-pipeline-secrets
+  namespace: fraud-detection
+type: Opaque
+stringData:
+  POSTGRES_DSN: "postgresql://feast:feast_secret@postgres-service:5432/fraud_features"
+
+---
+# ─── Transaction Producer (HPA-enabled) ─────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transaction-producer
+  namespace: fraud-detection
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: transaction-producer
+  template:
+    metadata:
+      labels:
+        app: transaction-producer
+    spec:
+      containers:
+        - name: producer
+          image: fraud-pipeline/producer:latest
+          resources:
+            requests: {cpu: "200m", memory: "256Mi"}
+            limits:   {cpu: "500m", memory: "512Mi"}
+          envFrom:
+            - configMapRef: {name: fraud-pipeline-config}
+          env:
+            - name: CONCEPT_DRIFT
+              value: "true"
+
+---
+# ─── Feature Engineering (Flink-style) ──────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-engineer
+  namespace: fraud-detection
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: feature-engineer
+  template:
+    metadata:
+      labels:
+        app: feature-engineer
+    spec:
+      containers:
+        - name: feature-job
+          image: fraud-pipeline/feature-job:latest
+          resources:
+            requests: {cpu: "500m", memory: "1Gi"}
+            limits:   {cpu: "2000m", memory: "2Gi"}
+          envFrom:
+            - configMapRef: {name: fraud-pipeline-config}
+            - secretRef: {name: fraud-pipeline-secrets}
+
+---
+# ─── Fraud Detector (with HPA) ──────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-detector
+  namespace: fraud-detection
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fraud-detector
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero-downtime deployments
+  template:
+    metadata:
+      labels:
+        app: fraud-detector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: fraud-detector
+          image: fraud-pipeline/fraud-detector:latest
+          ports:
+            - containerPort: 8000  # REST
+            - containerPort: 50051 # gRPC
+            - containerPort: 8001  # Prometheus
+          resources:
+            requests: {cpu: "1000m", memory: "2Gi"}
+            limits:   {cpu: "4000m", memory: "4Gi"}
+          envFrom:
+            - configMapRef: {name: fraud-pipeline-config}
+            - secretRef: {name: fraud-pipeline-secrets}
+          volumeMounts:
+            - name: model-volume
+              mountPath: /app/models
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: model-volume
+          persistentVolumeClaim:
+            claimName: model-pvc
+
+---
+# ─── Fraud Detector Service ──────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: fraud-detector-service
+  namespace: fraud-detection
+spec:
+  selector:
+    app: fraud-detector
+  ports:
+    - name: rest
+      port: 8000
+      targetPort: 8000
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: metrics
+      port: 8001
+      targetPort: 8001
+
+---
+# ─── Horizontal Pod Autoscaler ───────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fraud-detector-hpa
+  namespace: fraud-detection
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fraud-detector
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+---
+# ─── Drift Detector ──────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drift-detector
+  namespace: fraud-detection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: drift-detector
+  template:
+    metadata:
+      labels:
+        app: drift-detector
+    spec:
+      containers:
+        - name: drift-detector
+          image: fraud-pipeline/drift-detector:latest
+          resources:
+            requests: {cpu: "200m", memory: "512Mi"}
+            limits:   {cpu: "1000m", memory: "1Gi"}
+          envFrom:
+            - configMapRef: {name: fraud-pipeline-config}
+            - secretRef: {name: fraud-pipeline-secrets}
+          volumeMounts:
+            - name: model-volume
+              mountPath: /app/models
+      volumes:
+        - name: model-volume
+          persistentVolumeClaim:
+            claimName: model-pvc
+
+---
+# ─── PVC for Model Storage ───────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-pvc
+  namespace: fraud-detection
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# ─── Ingress ─────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fraud-detector-ingress
+  namespace: fraud-detection
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  rules:
+    - host: fraud-api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: fraud-detector-service
+                port:
+                  number: 8000

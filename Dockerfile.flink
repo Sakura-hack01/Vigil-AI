@@ -1,0 +1,2 @@
+FROM flink:1.18-scala_2.12-java11
+RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/*

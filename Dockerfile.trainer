@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir \
+    numpy pandas scikit-learn xgboost \
+    psycopg2-binary redis confluent-kafka
+COPY trainer.py .
+RUN mkdir -p /app/models
+CMD ["python", "-u", "trainer.py"]

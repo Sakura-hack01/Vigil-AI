@@ -1,0 +1,53 @@
+groups:
+  - name: fraud_detection_alerts
+    rules:
+
+      - alert: HighFraudRate
+        expr: fraud_anomaly_rate > 0.10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fraud rate above 10% — possible model failure or attack"
+          description: "Current fraud rate: {{ $value | humanizePercentage }}"
+
+      - alert: LowFraudRate
+        expr: fraud_anomaly_rate < 0.001
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fraud rate suspiciously low — model may be stuck"
+
+      - alert: HighPredictionLatency
+        expr: histogram_quantile(0.99, rate(fraud_prediction_latency_seconds_bucket{method="rest"}[5m])) > 0.050
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "REST P99 latency > 50ms"
+          description: "P99={{ $value | humanizeDuration }}"
+
+      - alert: KafkaLatencyHigh
+        expr: histogram_quantile(0.99, rate(fraud_prediction_latency_seconds_bucket{method="kafka"}[5m])) > 0.010
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka inference P99 > 10ms"
+
+      - alert: PredictionRateDrop
+        expr: rate(fraud_predictions_total[5m]) < 1
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prediction rate has dropped — pipeline may be down"
+
+      - alert: DataDrift
+        expr: fraud_anomaly_rate offset 30m > (fraud_anomaly_rate * 1.5)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Potential data drift: fraud rate has increased by >50%"

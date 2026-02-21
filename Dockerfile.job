@@ -1,0 +1,5 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir confluent-kafka redis numpy psycopg2-binary
+COPY feature_job.py .
+CMD ["python", "-u", "feature_job.py"]

@@ -1,0 +1,286 @@
+version: "3.9"
+
+networks:
+  fraud-net:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  redis_data:
+  postgres_data:
+  feast_data:
+
+services:
+  # ─────────────────────────────────────────────
+  # LAYER 0: Infrastructure
+  # ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    networks: [fraud-net]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    networks: [fraud-net]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    networks: [fraud-net]
+    depends_on: [kafka]
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: fraud-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  redis:
+    image: redis:7-alpine
+    hostname: redis
+    networks: [fraud-net]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    hostname: postgres
+    networks: [fraud-net]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: fraud_features
+      POSTGRES_USER: feast
+      POSTGRES_PASSWORD: feast_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U feast"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # LAYER 1: Data Ingestion — Kafka Producer
+  # ─────────────────────────────────────────────
+  transaction-producer:
+    build:
+      context: ./kafka
+      dockerfile: Dockerfile.producer
+    networks: [fraud-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      TOPIC_TRANSACTIONS: raw-transactions
+      TOPIC_LABELS: ground-truth-labels
+      TPS: 200              # Transactions per second
+      FRAUD_RATE: 0.02      # 2% base fraud rate
+      CONCEPT_DRIFT: "true" # Enable drift simulation
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # LAYER 2: Feature Engineering — Flink Processor
+  # ─────────────────────────────────────────────
+  flink-jobmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile.flink
+    hostname: flink-jobmanager
+    networks: [fraud-net]
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  flink-taskmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile.flink
+    networks: [fraud-net]
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+
+  flink-feature-job:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile.job
+    networks: [fraud-net]
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      FLINK_JOBMANAGER: flink-jobmanager:8081
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_DSN: postgresql://feast:feast_secret@postgres:5432/fraud_features
+    restart: on-failure
+
+  # ─────────────────────────────────────────────
+  # LAYER 3: Inference — FastAPI + gRPC Model Server
+  # ─────────────────────────────────────────────
+  model-trainer:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile.trainer
+    networks: [fraud-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./ml-service/models:/app/models
+    environment:
+      POSTGRES_DSN: postgresql://feast:feast_secret@postgres:5432/fraud_features
+      REDIS_HOST: redis
+      MODEL_PATH: /app/models
+    restart: on-failure
+
+  fraud-detector:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile.server
+    hostname: fraud-detector
+    networks: [fraud-net]
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"   # FastAPI REST
+      - "50051:50051" # gRPC
+    volumes:
+      - ./ml-service/models:/app/models
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_INPUT_TOPIC: engineered-features
+      KAFKA_OUTPUT_TOPIC: fraud-predictions
+      MODEL_PATH: /app/models
+      PROMETHEUS_PORT: 8001
+      GRPC_PORT: 50051
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # LAYER 4: MLOps & Observability
+  # ─────────────────────────────────────────────
+  drift-detector:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile.drift
+    networks: [fraud-net]
+    depends_on:
+      fraud-detector:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      PREDICTIONS_TOPIC: fraud-predictions
+      POSTGRES_DSN: postgresql://feast:feast_secret@postgres:5432/fraud_features
+      KS_DRIFT_THRESHOLD: 0.1
+      DRIFT_CHECK_INTERVAL: 300  # seconds
+      ALERT_WEBHOOK: http://alertmanager:9093/api/v1/alerts
+      RETRAINING_TRIGGER: "true"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    networks: [fraud-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-admin-api'
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    networks: [fraud-net]
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    networks: [fraud-net]
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on: [prometheus]
+    restart: unless-stopped

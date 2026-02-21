@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir \
+    numpy pandas scipy scikit-learn \
+    redis confluent-kafka requests
+COPY drift_detector.py .
+VOLUME ["/app/models"]
+CMD ["python", "-u", "drift_detector.py"]
